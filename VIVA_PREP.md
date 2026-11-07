@@ -1,81 +1,188 @@
 # Restaurant Review Agent — Viva Prep
 
-## 30-second project introduction
+## 30-second introduction
 
-“I built a restaurant discovery and review assistant over 14,351 Yelp review rows covering 2,526 businesses, alongside a small pizza review sample. Users can ask for restaurants by cuisine, location, or preferences, inspect evidence from reviews, request examples by rating, and check rating analytics. New reviews are submitted through a validated form; the CSV stays on the backend and the search index refreshes after submission.”
+“This project is a restaurant discovery and review assistant built with retrieval-augmented generation. It searches an included Yelp dataset and a smaller pizza review dataset. A user can ask for restaurants by cuisine and city, explore what reviewers say, request review examples, and get exact rating statistics. FastAPI serves the app, Chroma stores searchable review embeddings, and Gemini can summarize retrieved evidence. The current version is one tool-routed agent; I’ll describe a multi-agent extension as future work.”
 
-## Problem and users
+## What problem does it solve?
 
-- **Problem:** Manually scanning many customer reviews makes it hard to spot recurring praise and complaints or answer questions quickly.
-- **Users:** Restaurant staff, managers, or analysts reviewing customer feedback.
-- **Business value:** Faster feedback search, a quick view of rating trends, and an easy way to add new feedback.
+Restaurant customers and analysts can have many reviews to scan. This app searches the review data and returns a small, relevant set of businesses or review evidence. It also calculates rating counts and averages directly from the CSV data.
 
-## What the demo does
+The Yelp file contains **14,351 review rows for 2,526 distinct businesses**, across **371 city/state pairs**. The current index contains **14,478 rows** across Yelp and the included pizza review data. Yelp review dates span **2005–2018**, so the app cannot confirm current ratings, opening hours, availability, or whether a business is still operating.
 
-1. **Restaurant discovery and review Q&A:** Embeds the Yelp and pizza CSV rows with BAAI/bge-small-en-v1.5, stores/retrieves them through Chroma, and uses Gemini Flash to answer from relevant evidence. Recommendations include business names, locations, categories, business ratings, and review counts. The no-key fallback displays retrieved business evidence directly.
-2. **Rating filters:** “Good reviews” means ratings 3–5; “bad reviews” means 1–2. An exact request such as “show me 5 star reviews” filters to that rating and shows up to 7 rows.
-3. **Rating analytics:** Questions about average rating, rating distribution, or review count use a deterministic analytics route calculated from the CSVs with pandas.
-4. **Review submission:** A form validates title, rating, date, and review text. The backend appends the record to its managed CSV and refreshes the changed index data.
-5. **Health and metrics:** `/health` reports readiness and indexed-document count. `/metrics` reports request count, errors, and latency.
+## Architecture
 
-## Architecture at a glance
-
-```text
-Browser form/chat
-      │ HTTP + streamed responses
-      ▼
-FastAPI (api.py)
-      ├── review question ──► embeddings ──► Chroma retrieval ──► Gemini summary
-      ├── rating question ──► pandas analytics over CSV data
-      └── submitted review ─► validation ─► private CSV ─► index refresh
-
-Health and request metrics are exposed by FastAPI endpoints.
+```mermaid
+flowchart TD
+    U[Browser chat and review form] --> A[FastAPI: api.py]
+    A --> R{Intent router: agent.py}
+    R -->|Restaurant preference| S[Chroma semantic retrieval]
+    R -->|Review question or examples| S
+    R -->|Count or rating question| P[Pandas analytics over CSVs]
+    S --> E[Retrieved review rows and metadata]
+    E --> G[Gemini answer, when configured]
+    E --> F[Local evidence fallback, without Gemini or on failure]
+    G --> O[Stream answer, route, and selected sources]
+    F --> O
+    P --> O
+    O --> U
+    C[CSV files] --> I[Ingest: ingest.py]
+    I --> H[Hugging Face sentence embeddings]
+    H --> V[(Persistent Chroma index)]
+    V --> S
+    A --> M[/health and /metrics/]
 ```
 
-## Likely viva questions and concise answers
+### Main components
 
-**What makes this an agentic workflow?**  
-“It accepts a natural-language task and routes it to the appropriate capability: semantic review search and answer generation, or a rating analytics operation. The result is streamed back, with review evidence available when requested.”
+- **`static/index.html`** provides the chat, review form, health card, request metrics, and source-review table.
+- **`api.py`** starts FastAPI, validates requests with Pydantic, streams chat events using server-sent events, saves submitted reviews, and exposes `/health` and `/metrics`.
+- **`ingest.py`** reads CSV rows, turns each row into a LangChain document, preserves columns as metadata, embeds the documents, and stores them in Chroma. A hash manifest identifies changed or removed CSV files so only affected rows need reindexing. Chroma’s maximum batch size is respected during ingestion.
+- **`retrieval.py`** builds the Chroma retriever, configured to return up to 60 candidate rows for a query.
+- **`agent.py`** applies small, deterministic intent rules for restaurant search, review examples, capabilities, and analytics. It applies exact rating filters and filters retrieved recommendation candidates to a city when the query explicitly names one.
+- **`chat.py`** defines the Gemini prompt and streaming answer, selects diverse business evidence, and provides local fallbacks when Gemini is not configured or fails.
+- **`csv_data.py`** validates and safely writes submitted review rows to the backend-managed CSV.
+- **`config.py`** keeps model names, storage paths, and retrieval limits in one place. API keys are loaded from `.env`, which is excluded from Git.
 
-**Is it a multi-agent system?**  
-“No. This version is one assistant with restaurant search, review search, and deterministic analytics routes. Multi-agent coordination was optional in the guidance; I chose a smaller workflow that solves the review-analysis problem.”
+## How the system works
 
-**Why use RAG?**  
-“The model needs to answer from this specific, changing review dataset. Retrieval brings relevant rows into the prompt, so answers can be grounded in the current data instead of relying only on the model’s general training.”
+### 1. Indexing the data
+
+At startup, FastAPI calls `build_store()`. The ingester reads the project CSV files and managed upload CSVs. Each row becomes one document containing the row fields, such as review text, restaurant name, categories, city, state, and business rating. The embedding model **BAAI/bge-small-en-v1.5** converts the document text into a vector, and Chroma persists the vectors and metadata under `chroma_db/`.
+
+The manifest records each CSV’s SHA-256 hash and the embedding model name. If a file changes, the existing documents for that file are removed and its rows are embedded again. New rows use stable file-and-row IDs. Large files are sent to Chroma in supported batches.
+
+### 2. Handling a question
+
+1. The browser sends a question to `POST /chat`.
+2. FastAPI trims and validates it, with a maximum length of 1,000 characters.
+3. The router identifies the request type. For example, an average-rating question uses Pandas; a restaurant preference question uses semantic retrieval.
+4. For retrieval, Chroma returns relevant rows. When a city appears in the question and in the candidate metadata, recommendations are filtered to that city. Duplicate reviews from the same business are reduced before showing recommendations.
+5. If Gemini is configured, the app streams a response based on retrieved rows. If Gemini is unavailable, the app can still show the matching restaurant details or create a small local review summary.
+6. The response is streamed to the browser. Recommendation and explicit example requests include source rows in the UI.
+
+### 3. Handling submitted reviews
+
+The form submits structured fields to `POST /reviews`. Pydantic checks title, rating, date, and review length. `csv_data.py` writes to the managed CSV, then the index is rebuilt or refreshed. The CSV is stored on the backend and is not displayed as a downloadable file in the UI.
+
+## What features are implemented?
+
+- Search restaurant reviews by natural-language topic.
+- Find restaurants by cuisine and location using retrieved Yelp review evidence.
+- Return business name, city/state, categories, business rating, and review count when those fields exist in the source row.
+- Filter an explicit star-rating request and show selected review examples. The filter currently targets the `Rating` field; Yelp stores that value as `stars_review`, so consistent star filtering across both sources still needs schema normalization.
+- Calculate rating averages, counts, and distinct Yelp business counts deterministically with Pandas.
+- Accept validated review submissions and update search indexing.
+- Stream responses and expose basic service health and request/latency metrics.
+- Run locally; a Dockerfile is included for packaging.
+
+## Current design: single agent with tools
+
+**Is this a multi-agent system?**
+
+“No. It is one assistant with deterministic routing to capabilities: restaurant search, review search, and rating analytics. The LLM does not choose freely among many tools; the small router selects the path. That is easier to inspect and test for this project’s limited scope.”
+
+**What makes it agentic?**
+
+“It accepts a natural-language task and routes it to the relevant capability, such as retrieval or exact analytics, then combines the tool result into a response. It has bounded behavior rather than an open-ended autonomous loop.”
+
+### Short demo sequence
+
+1. **Restaurant search:** “Where should I go for great Indian food in Philadelphia?” Explain the `restaurant_search` route, semantic retrieval, city constraint, returned business metadata, and historical source evidence.
+2. **Review themes:** “What do customers say about the crust?” Explain that the review text is retrieved before the answer is generated.
+3. **Exact analytics:** “What is the average rating?” Explain that this takes the Pandas route and does not ask Gemini to calculate the average.
+4. **Capabilities:** “What can you do?” Show the bounded scope of the assistant.
+
+## How we could make it a multi-agent system
+
+Use a **supervisor and specialist agents**. Keep the existing APIs, CSVs, Chroma index, metrics, and exact Pandas analytics. Add orchestration around the capabilities rather than duplicating the data pipeline.
+
+```mermaid
+flowchart TD
+    Q[User question] --> C[Supervisor / query planner]
+    C -->|Restaurant discovery| R[Restaurant Finder Agent]
+    C -->|Review themes or sentiment| A[Review Analyst Agent]
+    C -->|Exact counts and averages| X[Deterministic Analytics Tool]
+    R -->|Candidate businesses plus source IDs| J[Recommendation Composer]
+    A -->|Review findings plus source IDs| J
+    X --> C
+    J --> V[Evidence and constraint check]
+    V --> O[Answer with sources or abstention]
+```
+
+### Specialist responsibilities
+
+1. **Supervisor / query planner** extracts the user’s intent and explicit constraints, such as city, cuisine, and desired review theme. It decides which specialist is needed. It asks a clarifying question if a required constraint is ambiguous.
+2. **Restaurant Finder Agent** uses Chroma to find candidate restaurants. It returns structured candidates, not a free-form answer: business name, city/state, categories, business rating, review count, and supporting row IDs.
+3. **Review Analyst Agent** retrieves and summarizes supporting praise, complaints, or themes. It must include the row IDs behind each finding.
+4. **Analytics capability** remains deterministic Pandas code for arithmetic. It does not need to be an LLM agent.
+5. **Recommendation Composer** compares the candidate list with the user’s stated preferences and writes a concise answer with evidence and limitations.
+6. **Evidence check** verifies that each recommendation exists in the retrieved candidate list, honors explicit city/cuisine constraints when possible, and has supporting rows. If evidence is missing, the system should say so.
+
+### Example multi-agent flow
+
+For “Find a well-rated Indian restaurant in Philadelphia and tell me what reviewers like about it,” the supervisor can run the finder and analyst in parallel. The finder returns matching businesses and ratings. The analyst retrieves positive review evidence about those businesses. The composer joins only candidates supported by both results, then returns short explanations and source rows. If the request is only “What is the average rating?”, the supervisor calls the analytics function directly and skips the LLM specialists.
+
+### A practical implementation sequence
+
+1. Define typed input/output schemas for the query plan, restaurant candidates, review findings, and final answer.
+2. Extract the current retrieval and analytics operations behind callable tools without changing their behavior.
+3. Add a supervisor graph with explicit routing and bounded parallel calls. A graph framework such as LangGraph is an option if it is already installed; otherwise a small explicit orchestration function is enough for a class demo.
+4. Require each specialist to return evidence IDs. Keep the current deterministic city filter and exact analytics.
+5. Add tests for routing, constraint handling, citations, missing evidence, and specialist failure. Compare the multi-agent result with the current single-agent baseline.
+6. Trace each agent/tool call and measure end-to-end latency, errors, token usage/cost, retrieval quality, and whether the final answer respects the constraints.
+
+Do not add agents just to increase the agent count. A multi-agent design is justified when subtasks can work independently or require distinct prompts and outputs. Otherwise, the current simpler router is cheaper and easier to debug.
+
+## Monitoring and MLOps points
+
+- **Health:** `GET /health` reports readiness, indexed document count, model names, whether Gemini is configured, and available routes.
+- **Runtime metrics:** `GET /metrics` reports request count, error count, total/average latency, and last-request latency.
+- **Data/index versioning:** the ingestion manifest stores source-file hashes and the embedding model name.
+- **Evaluation:** seven automated tests cover recommendation city constraints, distinct businesses, review summaries, rating filters, analytics routing, capabilities, no-match behavior, and statistics. A live retrieval check also verified cuisine-and-city search against the 14,478-row index.
+- **Reproducibility:** model names and retrieval limits live in configuration; dependencies are pinned in `requirements.txt`.
+- **Secrets:** API keys belong in `.env`, never in source control. The project’s `.gitignore` excludes `.env`, uploads, the virtual environment, and generated Chroma files.
+
+These are demo-level MLOps practices. Metrics are in memory and reset when the process restarts; they are not a durable monitoring service or alert system.
+
+## Likely viva questions and answers
+
+**Why use RAG instead of putting the whole CSV in the prompt?**  
+“The dataset has over fourteen thousand Yelp reviews. Retrieval selects relevant rows for each question, keeping the prompt smaller and making it easier to ground the answer in specific evidence.”
 
 **What does the embedding model do?**  
-“It converts review text and the user’s question into vectors so Chroma can retrieve semantically related reviews, even when the wording differs.”
+“It converts review text and a question into vectors. Chroma compares those vectors to find semantically related reviews, including cases where the wording differs.”
 
-**Why use a separate analytics route?**  
-“Average ratings and rating counts are exact calculations. Pandas gives a direct, reproducible result instead of asking a language model to do arithmetic.”
+**Why use Chroma?**  
+“It gives us persistent vector search and metadata filtering in a small local setup. Metadata lets the agent retain fields like business name, rating, and city alongside the review text.”
 
-**Can users edit the CSV?**  
-“No. They use the review form. CSV persistence and indexing stay on the backend; the UI never exposes the CSV file.”
+**Why use Pandas for rating questions?**  
+“Averages and counts are exact calculations, so the application computes them directly instead of asking an LLM to do arithmetic.”
 
-**How does a new review become searchable?**  
-“The API validates the form data, appends it to the managed review CSV, updates the changed file’s vectors, and replaces the app’s retriever with the refreshed store.”
+**How do you prevent unsupported answers?**  
+“The prompt instructs Gemini to use only retrieved reviews, and the no-model fallback only reports retrieved evidence. If retrieval is empty, the answer says it could not find supporting reviews. We still need a larger evaluation set to measure grounding systematically.”
 
-**What happens if Gemini is unavailable?**  
-“The app still uses retrieved reviews to produce a brief local summary, or displays the requested review examples. It should not present an AI-provider failure message as the answer.”
+**Are the recommendations current?**  
+“No. Yelp review dates span 2005 to 2018. The system can compare historical evidence, but cannot check current status, hours, availability, or ratings.”
 
-**What are the Yelp data limits?**  
-"These records are historical, dated 2005–2018. They support review-based discovery but cannot confirm current business status, hours, availability, or ratings."
+**What happens when Gemini is unavailable?**  
+“Restaurant search can show retrieved business details directly and analytics still works because it is deterministic. Review questions use a local keyword-and-rating summary; that fallback currently reads the `Rating` field, so it does not interpret Yelp’s `stars_review` field consistently yet.”
 
-**How do you monitor the app?**  
-“`/health` exposes readiness and the indexed count. `/metrics` exposes request/error counts and average and last latency. Those are basic operational signals for this demo.”
+**What is monitored?**  
+“The health endpoint reports readiness and index size. The metrics endpoint tracks requests, errors, and latency. These counters reset on restart, so production monitoring would need durable metrics, traces, dashboards, and alerts.”
 
-**Is it deployed to the cloud?**  
-“No. The current demo runs locally and has Docker instructions. A hosted production deployment and its monitoring setup are future work.”
+**Is it deployed?**  
+“It runs as a local FastAPI app, and a Dockerfile is included. It is not deployed as a hosted production service.”
 
-**What are the limitations?**  
-“It answers from the included review datasets, not arbitrary outside facts. Yelp records are historical, so they are not live business information. The local CSV and vector store are appropriate for a small demo; a hosted multi-user version should use a database, authentication, and production monitoring.”
-
-**What would you improve next?**  
-“Deploy it with persistent managed storage, authentication, and alerts; add evaluation questions to check answer grounding and retrieval quality; and consider multi-agent coordination only if the workflow grows enough to justify it.”
+**What would you improve first?**  
+“I would improve the evaluation set and retrieval/answer grounding checks, then add durable monitoring and a secure hosted deployment. I would add specialist agents only when a workflow needs parallel or distinct reasoning.”
 
 ## Honest scope to state
 
-- This is a working **single-agent, tool-routed** demo; do not call it a multi-agent system.
-- Health and metrics are implemented, but this project is **not currently deployed as a hosted production service**.
-- The assistant is scoped to the review dataset. It should say when the reviews do not support an answer.
-- The source CSV is backend data; users submit reviews through the UI rather than editing the CSV.
+- This is a working **single-agent, tool-routed** application, not a multi-agent system yet.
+- Yelp evidence is historical and should not be presented as live business information.
+- The model can only answer about the included datasets; it does not browse current menus, prices, hours, or business status.
+- Yelp star ratings use a different source column from the pizza sample, so exact rating filters and the local sentiment fallback need a shared normalized rating field.
+- Price and occasion are not structured business fields; the model can only match them when retrieved review text supports the preference.
+- Health and request metrics are implemented, but durable monitoring and cloud deployment are future work.
+- The review submission form creates generic review rows; it does not collect structured restaurant identity fields like the Yelp data does.
