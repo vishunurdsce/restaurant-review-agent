@@ -1,0 +1,9 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "functions": {
+    "vercel_runtime.py": {
+      "includeFiles": "{realistic_restaurant_reviews.csv,yelp_restaurant_reviews.csv,static/**}",
+      "maxDuration": 60
+    }
+  }
+}
