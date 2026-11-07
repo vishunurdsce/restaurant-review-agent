@@ -5,4 +5,4 @@ requires-python = ">=3.12,<3.13"
 dependencies = ["fastapi==0.141.1"]
 
 [tool.vercel]
-entrypoint = "vercel_runtime:app"
+entrypoint = "restaurant_app:app"
