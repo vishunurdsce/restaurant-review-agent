@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: restaurant-review-agent
+    runtime: docker
+    plan: starter
+    healthCheckPath: /health
+    disk:
+      name: restaurant-agent-data
+      mountPath: /app/chroma_db
+      sizeGB: 1
